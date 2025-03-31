@@ -1,8 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Optional, Dict, Any, Tuple
-import hashlib
+from typing import List, Optional, Dict, Any
 from functools import lru_cache
 
 import logging
@@ -84,8 +83,7 @@ class MultiSpecializedLanguageModelPipeline:
     def __init__(
         self, 
         models_config: Optional[Dict[str, Any]] = None,
-        device: Optional[str] = None,
-        cache_size: int = 100
+        device: Optional[str] = None
     ):
         logger.info("Initializing Multi-Specialized Language Model Pipeline")
         
@@ -104,7 +102,7 @@ class MultiSpecializedLanguageModelPipeline:
                 'quantization': True
             },
             'merger': {
-                'model_name': 'google/flan-t5-large',
+                'model_name': 'google/flan-t5-large',  # Changed to a smaller model for easier testing
                 'model_type': 'seq2seq',
                 'quantization': False
             }
@@ -112,8 +110,8 @@ class MultiSpecializedLanguageModelPipeline:
 
         self.models = {}
         self.tokenizers = {}
+        self.response_cache = {}
         self.cross_attention = None
-        self.cache_size = cache_size
         
         self._load_models()
 
@@ -123,17 +121,6 @@ class MultiSpecializedLanguageModelPipeline:
                 input_dim=merger_model_dim, 
                 hidden_dim=merger_model_dim
             ).to(self.device)
-            
-        # Initialize the cache outside of the method to avoid reinitializing
-        # on each call to _generate_model_response
-        self._init_cache()
-
-    def _init_cache(self):
-        """Initialize the LRU cache for model responses"""
-        # Using a separate method to set up the cache
-        # This allows us to clear the cache without recreating it
-        self._generate_model_response = lru_cache(maxsize=self.cache_size)(self._generate_model_response_uncached)
-        logger.info(f"Initialized response cache with size {self.cache_size}")
 
     def _load_models(self):
         for model_key, config in self.models_config.items():
@@ -167,67 +154,6 @@ class MultiSpecializedLanguageModelPipeline:
                 logger.error(f"Error loading {model_key} model: {e}")
                 logger.error(traceback.format_exc())
 
-    def _generate_query_hash(self, query: str, model_key: str, max_length: int, temperature: float, top_p: float) -> str:
-        """Generate a unique hash for the query and generation parameters"""
-        hash_input = f"{query}_{model_key}_{max_length}_{temperature}_{top_p}"
-        return hashlib.md5(hash_input.encode()).hexdigest()
-
-    def _generate_model_response_uncached(
-        self, 
-        model_key: str, 
-        query_hash: str,  # This parameter is just for the cache key, not used in the function
-        query: str,
-        max_length: int,
-        temperature: float,
-        top_p: float
-    ) -> str:
-        """The actual function that generates responses (uncached version)"""
-        logger.info(f"Cache miss for {model_key} with query hash {query_hash[:8]}...")
-        
-        if model_key not in self.models or model_key not in self.tokenizers:
-            logger.warning(f"Model {model_key} not loaded. Skipping response generation.")
-            return ""
-
-        tokenizer = self.tokenizers[model_key]
-        model = self.models[model_key]
-
-        generation_config = GenerationConfig(
-            max_new_tokens=max_length,
-            do_sample=True,
-            temperature=temperature,
-            top_p=top_p
-        )
-
-        try:
-            # Create a prompt specific to the model type
-            prompt = f"Respond to the following query from a {model_key} perspective: {query}"
-            
-            inputs = tokenizer(
-                prompt, 
-                return_tensors='pt', 
-                truncation=True, 
-                max_length=max_length
-            ).to(self.device)
-
-            outputs = model.generate(
-                **inputs, 
-                generation_config=generation_config
-            )
-
-            response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-            logger.info(f"Generated response for {model_key} (length: {len(response)})")
-            return response
-
-        except Exception as e:
-            logger.warning(f"Error generating response for {model_key}: {e}")
-            logger.warning(traceback.format_exc())
-            return ""
-
-    def clear_cache(self):
-        """Clear the response cache"""
-        logger.info("Clearing response cache")
-        self._generate_model_response.cache_clear()
-
     def generate_response(
         self, 
         query: str, 
@@ -237,27 +163,40 @@ class MultiSpecializedLanguageModelPipeline:
     ) -> str:
         responses = {}
 
+        generation_config = GenerationConfig(
+            max_new_tokens=max_length,
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p
+        )
+
         # Generate responses from specialized models
         for model_key, model in self.models.items():
             if model_key == 'merger':
                 continue
-                
-            # Generate hash for caching
-            query_hash = self._generate_query_hash(query, model_key, max_length, temperature, top_p)
-            
-            # Check if we've already generated this response
-            response = self._generate_model_response(
-                model_key=model_key,
-                query_hash=query_hash,  # Used as part of the cache key
-                query=query,
-                max_length=max_length,
-                temperature=temperature,
-                top_p=top_p
-            )
-            
-            if response:
+
+            tokenizer = self.tokenizers[model_key]
+
+            try:
+                inputs = tokenizer(
+                    f"Respond to the following query from a {model_key} perspective: {query}", 
+                    return_tensors='pt', 
+                    truncation=True, 
+                    max_length=max_length
+                ).to(self.device)
+
+                outputs = model.generate(
+                    **inputs, 
+                    generation_config=generation_config
+                )
+
+                response = tokenizer.decode(outputs[0], skip_special_tokens=True)
                 responses[model_key] = response
-                logger.info(f"Got response for {model_key} (cache hit: {query_hash[:8]})")
+                logger.info(f"{model_key.capitalize()} Response: {response}")
+
+            except Exception as e:
+                logger.warning(f"Error generating response for {model_key}: {e}")
+                logger.warning(traceback.format_exc())
 
         if not responses:
             return "Unable to generate responses from specialized models."
@@ -277,25 +216,25 @@ class MultiSpecializedLanguageModelPipeline:
             return "\n\n".join([f"{k.capitalize()} Perspective: {v}" for k, v in responses.items()])
 
         try:
-            # Generate hash for merger cache
-            merger_hash = self._generate_query_hash(merger_prompt, 'merger', max_length, temperature, top_p)
-            
-            # Check if we've already generated this merged response
-            final_response = self._generate_model_response(
-                model_key='merger',
-                query_hash=merger_hash,
-                query=merger_prompt,
-                max_length=max_length,
-                temperature=temperature,
-                top_p=top_p
+            # Tokenize and encode merger prompt
+            merger_inputs = merger_tokenizer(
+                merger_prompt, 
+                return_tensors='pt', 
+                truncation=True, 
+                max_length=max_length
+            ).to(self.device)
+
+            # Generate merged response using the T5-style model
+            outputs = merger_model.generate(
+                **merger_inputs,
+                generation_config=generation_config,
+                max_new_tokens=max_length
             )
-            
-            if final_response:
-                logger.info(f"Generated merged response (length: {len(final_response)})")
-                return final_response
-            else:
-                logger.warning("Failed to generate merged response")
-                return "\n\n".join([f"{k.capitalize()} Perspective: {v}" for k, v in responses.items()])
+
+            # Decode final response
+            final_response = merger_tokenizer.decode(outputs[0], skip_special_tokens=True)
+            logger.info(f"Merged Response: {final_response}")
+            return final_response
 
         except Exception as e:
             logger.error(f"Error in merger model processing: {e}")
@@ -309,9 +248,6 @@ class MultiSpecializedLanguageModelPipeline:
         logger.info("Clearing pipeline resources")
         
         try:
-            # Clear cache
-            self.clear_cache()
-            
             # Clear models
             for model_key in list(self.models.keys()):
                 try:
