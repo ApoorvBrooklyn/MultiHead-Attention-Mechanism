@@ -169,3 +169,6 @@ pipeline.clear_resources()
    - Interactive response refinement
    - Domain-specific fine-tuning options
    - Extended quantization support
+
+
+### Note if the Project is not working replace Main.py with Backup.py 
