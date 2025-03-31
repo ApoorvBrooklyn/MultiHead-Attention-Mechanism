@@ -10,8 +10,13 @@ import os
 from typing import Optional
 
 from main import MultiSpecializedLanguageModelPipeline
+import os
+from dotenv import load_dotenv
+load_dotenv()
 
-os.environ["NGROK_AUTH_TOKEN"] = "ENTER_YOUR_NGROK_AUTH_TOKEN"
+NGROK_AUTH_TOKEN = os.getenv("NGROK_AUTH_KEY")
+
+
 
 # Initialize nest-asyncio
 nest_asyncio.apply()
